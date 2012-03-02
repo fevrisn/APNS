@@ -34,6 +34,8 @@ module APNS
   @@ssl = {}
   @@sock = {}
 
+  @@timings = {}
+
   class << self
     attr_accessor :host, :port, :feedback_host, :feedback_port, :logger
     def pem(stream = :_global, new_pem = nil)
@@ -47,6 +49,22 @@ module APNS
       @pass[stream]
     end
     def pass=(new_pass); @pass[:_global] = new_pass; end
+  end
+
+  def self.time_logged label
+    start = Time.now.to_f
+    (yield).tap do
+      @@timings[label] ||= 0
+      @@timings[label] += Time.now.to_f - start
+    end
+  end
+  def self.flush_timing_logg
+    if logger.present?
+      @@timings.each do |label, time|
+        logger.warn "#{label}: #{time}s"
+      end
+      true
+    end
   end
 
   # send one or many payloads
@@ -69,39 +87,61 @@ module APNS
 
   # Send to a pem stream
   def self.send_stream(stream, *payloads)
-    payloads.flatten!
+    time_logged :send_stream do
 
-    # retain valid payloads only
-    payloads.reject!{ |p| !(p.is_a?(APNS::Payload) && p.valid?) }
+      time_logged :flatten_payloads do
+        payloads.flatten!
+      end
 
-    return if (payloads.nil? || payloads.count < 1)
+      # retain valid payloads only
+      time_logged :validate_payload do
+        payloads.reject!{ |p| !(p.is_a?(APNS::Payload) && p.valid?) }
+      end
 
-    # loop through each payloads
-    payloads.each do |payload|
-      retry_delay = 2
+      return if (payloads.nil? || payloads.count < 1)
 
-      # !ToDo! do a better job by using a select to poll the socket for a possible response from apple to inform us about an error in the sent payload
-      #
-      begin
-        @@sock[stream], @@ssl[stream] = self.push_connection(stream) if @@ssl[stream].nil?
-        @@ssl[stream].write(payload.to_ssl); @@ssl[stream].flush
-      rescue PemPathError, PemFileError => e
-        raise e
-      rescue
-        @@ssl[stream].close; @@sock[stream].close
-        @@ssl[stream] = nil; @@sock[stream] = nil # cleanup
+      # loop through each payloads
+      payloads.each do |payload|
+        retry_delay = 2
 
-        retry_delay *= 2
-        if retry_delay <= 8
-          logger.warn "Failed to write payload, sleeping for #{retry_delay}s!" if logger.present?
-          sleep retry_delay
-          retry
-        else
-          raise
-        end
-      end # begin block
+        # !ToDo! do a better job by using a select to poll the socket for a possible response from apple to inform us about an error in the sent payload
+        #
+        begin
+          time_logged :connect do
+            if @@ssl[stream].nil?
+              @@sock[stream], @@ssl[stream] = self.push_connection(stream)
+            end
+          end
+          ssl_payload = time_logged :make_payload do
+            payload.to_ssl
+          end
+          time_logged :write do
+            @@ssl[stream].write(ssl_payload);
+          end
+          time_logged :flush do
+            @@ssl[stream].flush
+          end
+        rescue PemPathError, PemFileError => e
+          raise e
+        rescue
+          @@ssl[stream].close; @@sock[stream].close
+          @@ssl[stream] = nil; @@sock[stream] = nil # cleanup
 
-    end # each payloads
+          retry_delay *= 2
+          if retry_delay <= 8
+            logger.warn "Failed to write payload, sleeping for #{retry_delay}!" if logger.present?
+            time_logged :sleep do
+              sleep retry_delay
+            end
+            retry
+          else
+            raise
+          end
+        end # begin block
+
+      end # each payloads
+    end
+    flush_timing_logg
   end
 
   def self.send_payloads(*payloads)
@@ -144,10 +184,20 @@ module APNS
   end
 
   def self.connect_to(aps_host, aps_port, stream = :_global)
-    context      = self.ssl_context(stream)
-    sock         = TCPSocket.new(aps_host, aps_port)
-    ssl          = OpenSSL::SSL::SSLSocket.new(sock, context)
-    ssl.connect
+
+    context, sock, ssl = nil, nil, nil
+    context = time_logged :connect__ssl_context do
+      self.ssl_context(stream)
+    end
+    sock = time_logged :connect__tcp_socket_new do
+      TCPSocket.new(aps_host, aps_port)
+    end
+    ssl = time_logged :connect__ssl_socket_new do
+      OpenSSL::SSL::SSLSocket.new(sock, context)
+    end
+    time_logged :connect__ssl_connect do
+      ssl.connect
+    end
 
     return sock, ssl
   end
